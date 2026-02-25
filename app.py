@@ -557,19 +557,18 @@ async def bitrix_install(request: Request):
     access_token  = auth.get("access_token") or payload.get("AUTH_ID", "")
     refresh_token = auth.get("refresh_token") or payload.get("REFRESH_ID", "")
     expires_in    = int(auth.get("expires_in") or payload.get("AUTH_EXPIRES") or 3600)
-    # Bitrix24 sends SERVER_ENDPOINT (not DOMAIN) in the install callback
-    server_endpoint = (
-        payload.get("SERVER_ENDPOINT")
-        or auth.get("domain")
-        or payload.get("DOMAIN", "")
-    )
+    # SERVER_ENDPOINT is the REST API base URL (e.g. https://oauth.bitrix.info/rest/)
+    server_endpoint = payload.get("SERVER_ENDPOINT") or ""
+    # DOMAIN is the portal hostname (e.g. motoclube.bitrix24.com.br)
+    portal_domain = payload.get("DOMAIN") or auth.get("domain") or ""
     member_id = payload.get("member_id") or payload.get("MEMBER_ID", "")
-    domain = server_endpoint  # store the REST endpoint as domain for API calls
+    domain = server_endpoint  # keep existing column pointing to REST endpoint
 
     if access_token and server_endpoint:
         storage.save_oauth(
             access_token, refresh_token, expires_in, domain,
             member_id=member_id, server_endpoint=server_endpoint,
+            portal_domain=portal_domain,
         )
         app_token = (
             auth.get("application_token") or payload.get("APPLICATION_TOKEN", "")
@@ -580,8 +579,8 @@ async def bitrix_install(request: Request):
                 app_token,
             )
         logger.info(
-            "Install OK: member_id=%s, endpoint=%s, expires_in=%s",
-            member_id, server_endpoint, expires_in,
+            "Install OK: member_id=%s, portal=%s, endpoint=%s, expires_in=%s",
+            member_id, portal_domain, server_endpoint, expires_in,
         )
         return HTMLResponse(
             "<html><body style='font-family:sans-serif;padding:40px;text-align:center'>"
@@ -737,7 +736,7 @@ async def health():
     return {
         "status": "ok",
         "bitrix_authed": oauth is not None,
-        "bitrix_domain": oauth["domain"] if oauth else None,
+        "bitrix_domain": (oauth.get("portal_domain") or None) if oauth else None,
         "instances": [
             {"name": i.name, "label": i.label, "line_id": i.bitrix24_line_id}
             for i in instances

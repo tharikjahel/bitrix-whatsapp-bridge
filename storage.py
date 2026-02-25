@@ -31,11 +31,12 @@ def init_db():
                 expires_at      REAL,
                 domain          TEXT,
                 member_id       TEXT,
-                server_endpoint TEXT
+                server_endpoint TEXT,
+                portal_domain   TEXT
             )
         """)
         # migrate existing databases that lack the new columns
-        for col_def in ("member_id TEXT", "server_endpoint TEXT"):
+        for col_def in ("member_id TEXT", "server_endpoint TEXT", "portal_domain TEXT"):
             try:
                 conn.execute(f"ALTER TABLE oauth_tokens ADD COLUMN {col_def}")
             except sqlite3.OperationalError:
@@ -92,23 +93,26 @@ def save_oauth(
     domain: str,
     member_id: str = "",
     server_endpoint: str = "",
+    portal_domain: str = "",
 ):
     expires_at = time.time() + int(expires_in)
     with _lock, sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
             INSERT INTO oauth_tokens
-                (id, access_token, refresh_token, expires_at, domain, member_id, server_endpoint)
-            VALUES (1, ?, ?, ?, ?, ?, ?)
+                (id, access_token, refresh_token, expires_at, domain,
+                 member_id, server_endpoint, portal_domain)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 access_token    = excluded.access_token,
                 refresh_token   = excluded.refresh_token,
                 expires_at      = excluded.expires_at,
                 domain          = excluded.domain,
                 member_id       = excluded.member_id,
-                server_endpoint = excluded.server_endpoint
+                server_endpoint = excluded.server_endpoint,
+                portal_domain   = excluded.portal_domain
             """,
-            (access_token, refresh_token, expires_at, domain, member_id, server_endpoint),
+            (access_token, refresh_token, expires_at, domain, member_id, server_endpoint, portal_domain),
         )
         conn.commit()
 
@@ -116,7 +120,8 @@ def save_oauth(
 def get_oauth() -> dict | None:
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT access_token, refresh_token, expires_at, domain, member_id, server_endpoint "
+            "SELECT access_token, refresh_token, expires_at, domain, "
+            "member_id, server_endpoint, portal_domain "
             "FROM oauth_tokens WHERE id = 1"
         ).fetchone()
     if not row:
@@ -128,4 +133,5 @@ def get_oauth() -> dict | None:
         "domain":          row[3],
         "member_id":       row[4],
         "server_endpoint": row[5],
+        "portal_domain":   row[6] or "",
     }
