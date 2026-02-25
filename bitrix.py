@@ -99,7 +99,9 @@ async def call(method: str, params: dict | None = None) -> dict:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 url,
-                headers={"Authorization": f"Bearer {token}"},
+                # Bitrix24 standard: access_token as ?auth= query param.
+                # The Authorization: Bearer header is less reliable across methods.
+                params={"auth": token},
                 json=params or {},
             )
             r.raise_for_status()
@@ -122,6 +124,50 @@ async def call(method: str, params: dict | None = None) -> dict:
             f"{resp.get('error_description', '')}"
         )
     return resp
+
+
+async def detect_portal_domain() -> str:
+    """
+    Call app.info through the OAuth proxy to discover the portal domain.
+    Returns the portal hostname, e.g. 'motoclube.bitrix24.com.br'.
+    Saves the result to storage so subsequent calls use the portal URL.
+    """
+    data = storage.get_oauth()
+    if not data:
+        raise RuntimeError("Not authenticated")
+
+    proxy_base = data.get("server_endpoint") or "https://oauth.bitrix.info/rest/"
+    url = f"{proxy_base.rstrip('/')}/app.info.json"
+    logger.info("Detecting portal domain via %s", url)
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(url, params={"auth": data["access_token"]}, json={})
+        r.raise_for_status()
+        resp = r.json()
+
+    logger.info("app.info response: %s", resp)
+    result = resp.get("result", {})
+
+    # Bitrix24 app.info returns DOMAIN with the portal hostname
+    domain = (
+        result.get("DOMAIN")
+        or result.get("domain")
+        or ""
+    ).strip()
+
+    if domain:
+        storage.save_oauth(
+            access_token=data["access_token"],
+            refresh_token=data["refresh_token"],
+            expires_in=max(60, int(data["expires_at"] - time.time())),
+            domain=data.get("domain", ""),
+            member_id=data.get("member_id", ""),
+            server_endpoint=data.get("server_endpoint", ""),
+            portal_domain=domain,
+        )
+        logger.info("portal_domain auto-detected and saved: %s", domain)
+
+    return domain
 
 
 # ─── imconnector (multi-instance) ───────────────────────────────────────────

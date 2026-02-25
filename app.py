@@ -755,12 +755,23 @@ async def run_setup(request: Request):
         raise HTTPException(
             400, "Bitrix24 not authenticated. Install the local app first."
         )
-    if not oauth.get("server_endpoint"):
-        raise HTTPException(
-            400,
-            "server_endpoint not set. Re-install the Bitrix24 app "
-            "so SERVER_ENDPOINT is captured correctly."
-        )
+
+    # If portal_domain is not stored, auto-detect it via app.info before proceeding.
+    # This happens when the app was installed before portal_domain capture was added.
+    if not oauth.get("portal_domain"):
+        logger.info("portal_domain missing — attempting auto-detection via app.info")
+        try:
+            detected = await bitrix.detect_portal_domain()
+            if detected:
+                logger.info("Auto-detected portal_domain: %s", detected)
+                oauth = storage.get_oauth()  # reload with updated portal_domain
+            else:
+                logger.warning(
+                    "app.info did not return a DOMAIN field. "
+                    "Set portal_domain manually via POST /admin/portal-domain"
+                )
+        except Exception as exc:
+            logger.error("portal_domain auto-detection failed: %s", exc)
 
     steps = []
 
@@ -846,7 +857,59 @@ async def run_setup(request: Request):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 7.  Health & Debug
+# 7.  Admin helpers
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.post("/admin/portal-domain")
+async def admin_set_portal_domain(request: Request):
+    """
+    Manually set the Bitrix24 portal domain when auto-detection fails.
+    Body: {"portal_domain": "motoclube.bitrix24.com.br"}
+    """
+    body = await request.json()
+    domain = str(body.get("portal_domain", "")).strip().lower()
+    if not domain:
+        raise HTTPException(400, "portal_domain is required")
+
+    oauth = storage.get_oauth()
+    if not oauth:
+        raise HTTPException(400, "Not authenticated — install the Bitrix24 app first.")
+
+    storage.save_oauth(
+        access_token=oauth["access_token"],
+        refresh_token=oauth["refresh_token"],
+        expires_in=max(60, int(oauth["expires_at"] - time.time())),
+        domain=oauth.get("domain", ""),
+        member_id=oauth.get("member_id", ""),
+        server_endpoint=oauth.get("server_endpoint", ""),
+        portal_domain=domain,
+    )
+    logger.info("portal_domain manually set to: %s", domain)
+    return {"ok": True, "portal_domain": domain}
+
+
+@app.get("/admin/detect-portal")
+async def admin_detect_portal():
+    """
+    Auto-detect portal domain via Bitrix24 app.info and save it.
+    Call this once if portal_domain is missing from /health.
+    """
+    try:
+        domain = await bitrix.detect_portal_domain()
+    except Exception as exc:
+        raise HTTPException(502, f"Detection failed: {exc}")
+
+    if not domain:
+        raise HTTPException(
+            502,
+            "app.info did not return a DOMAIN field. "
+            "Use POST /admin/portal-domain to set it manually."
+        )
+    return {"ok": True, "portal_domain": domain}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 8.  Health & Debug
 # ════════════════════════════════════════════════════════════════════════════
 
 def _dns_check(hostname: str) -> dict:
