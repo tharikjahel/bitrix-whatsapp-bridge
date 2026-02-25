@@ -37,18 +37,19 @@ async def _get_token() -> tuple[str, str]:
             "Install the local app first (visit /bitrix/install)."
         )
 
-    # server_endpoint is the authoritative REST base URL captured at install.
-    # portal_domain is the portal hostname (fallback to build a URL).
-    # domain is a legacy field — may hold the same value as server_endpoint.
+    # Priority: portal_domain → portal-specific REST endpoint (required for
+    # imconnector.*, event.*, imopenlines.* methods).
+    # server_endpoint (oauth.bitrix.info/rest/) is the OAuth proxy and does NOT
+    # support all REST methods — use it only when portal_domain is absent.
     rest_base = (
-        data.get("server_endpoint")
-        or (f"https://{data['portal_domain']}/rest/" if data.get("portal_domain") else "")
+        (f"https://{data['portal_domain']}/rest/" if data.get("portal_domain") else "")
+        or data.get("server_endpoint")
         or data.get("domain", "")
     )
     if not rest_base or not rest_base.startswith("http"):
         raise RuntimeError(
-            "No valid REST endpoint found in stored OAuth data. "
-            "Re-install the Bitrix24 app so SERVER_ENDPOINT is captured correctly."
+            "No portal_domain stored. Re-install the Bitrix24 app so that "
+            "DOMAIN is captured — it will be used as the REST endpoint."
         )
 
     if time.time() < data["expires_at"] - 300:

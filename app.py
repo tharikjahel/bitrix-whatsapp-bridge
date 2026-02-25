@@ -22,7 +22,7 @@ import socket
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -645,22 +645,9 @@ async def api_evolution_instances():
 async def api_list_instances():
     """
     List CONFIGURED instances (those linked via /setup) with their Evolution status.
-    Falls back to instances.json if DB is empty (legacy mode).
+    Does NOT fall back to instances.json — only returns instances set up via /setup.
     """
     db_instances = storage.get_instance_lines()
-
-    # Fallback to instances.json if nothing configured via setup yet
-    if not db_instances:
-        cfg = get_instances()
-        db_instances = [
-            {
-                "instance_name":      i.name,
-                "evolution_instance": i.evolution_instance,
-                "bitrix_line_id":     i.bitrix24_line_id,
-                "label":              i.label,
-            }
-            for i in cfg
-        ]
 
     result = []
     for inst in db_instances:
@@ -838,7 +825,8 @@ async def run_setup(request: Request):
             steps.append(step)
 
         # 3c: Set Evolution webhook
-        webhook_url = f"{settings.app_url}/webhook/evolution/{inst_name}"
+        # URL-encode the instance name so spaces/special chars are safe in the URL
+        webhook_url = f"{settings.app_url}/webhook/evolution/{quote(inst_name, safe='')}"
         step = {
             "name":     "set_evolution_webhook",
             "instance": inst_name,
