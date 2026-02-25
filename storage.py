@@ -2,6 +2,7 @@
 SQLite storage for:
   - OAuth tokens (Bitrix24 access/refresh)
   - Chat session mapping: bitrix_chat_id <-> (WhatsApp phone + instance)
+  - Instance lines: instance_name <-> Bitrix24 line_id (set via /setup)
 """
 import sqlite3
 import threading
@@ -33,6 +34,14 @@ def init_db():
                 member_id       TEXT,
                 server_endpoint TEXT,
                 portal_domain   TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS instance_lines (
+                instance_name      TEXT PRIMARY KEY,
+                evolution_instance TEXT NOT NULL,
+                bitrix_line_id     TEXT NOT NULL,
+                label              TEXT DEFAULT ''
             )
         """)
         # migrate existing databases that lack the new columns
@@ -134,4 +143,82 @@ def get_oauth() -> dict | None:
         "member_id":       row[4],
         "server_endpoint": row[5],
         "portal_domain":   row[6] or "",
+    }
+
+
+# ─── Instance lines ─────────────────────────────────────────────────────────
+
+def save_instance_line(
+    instance_name: str,
+    evolution_instance: str,
+    bitrix_line_id: str,
+    label: str = "",
+):
+    """Persist an instance_name → (evolution_instance, bitrix_line_id) mapping."""
+    with _lock, sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO instance_lines (instance_name, evolution_instance, bitrix_line_id, label)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(instance_name) DO UPDATE SET
+                evolution_instance = excluded.evolution_instance,
+                bitrix_line_id     = excluded.bitrix_line_id,
+                label              = excluded.label
+            """,
+            (instance_name, evolution_instance, bitrix_line_id, label),
+        )
+        conn.commit()
+
+
+def get_instance_lines() -> list[dict]:
+    """Return all configured instance→line mappings."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT instance_name, evolution_instance, bitrix_line_id, label "
+            "FROM instance_lines"
+        ).fetchall()
+    return [
+        {
+            "instance_name":      r[0],
+            "evolution_instance": r[1],
+            "bitrix_line_id":     r[2],
+            "label":              r[3] or "",
+        }
+        for r in rows
+    ]
+
+
+def get_line_by_instance(instance_name: str) -> dict | None:
+    """Lookup by instance_name. Returns None if not configured."""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT instance_name, evolution_instance, bitrix_line_id, label "
+            "FROM instance_lines WHERE instance_name = ?",
+            (instance_name,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "instance_name":      row[0],
+        "evolution_instance": row[1],
+        "bitrix_line_id":     row[2],
+        "label":              row[3] or "",
+    }
+
+
+def get_instance_by_line_db(line_id: str) -> dict | None:
+    """Lookup by Bitrix24 line_id. Returns None if not found."""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT instance_name, evolution_instance, bitrix_line_id, label "
+            "FROM instance_lines WHERE bitrix_line_id = ?",
+            (line_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "instance_name":      row[0],
+        "evolution_instance": row[1],
+        "bitrix_line_id":     row[2],
+        "label":              row[3] or "",
     }

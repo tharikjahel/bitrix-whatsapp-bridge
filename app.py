@@ -18,6 +18,7 @@ Flows:
 import json
 import logging
 import re
+import socket
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -56,14 +57,11 @@ async def lifespan(app: FastAPI):
     storage.init_db()
     init_instances()
     MEDIA_DIR.mkdir(exist_ok=True)
-    instances = get_instances()
+    db_lines = storage.get_instance_lines()
+    cfg_instances = get_instances()
     logger.info(
-        "Loaded %d instance(s): %s",
-        len(instances),
-        ", ".join(
-            f"{i.name} ({i.evolution_instance}→line {i.bitrix24_line_id})"
-            for i in instances
-        ),
+        "DB instance_lines: %d | instances.json: %d",
+        len(db_lines), len(cfg_instances),
     )
     yield
 
@@ -83,10 +81,20 @@ app = FastAPI(
 async def evolution_webhook(
     instance_name: str, request: Request, bg: BackgroundTasks,
 ):
-    inst = get_instance_by_name(instance_name)
-    if not inst:
-        logger.warning("Webhook for unknown instance: %s", instance_name)
-        raise HTTPException(404, f"Instance '{instance_name}' not configured")
+    # Resolve instance: DB first (set via /setup), then instances.json (legacy)
+    db_inst = storage.get_line_by_instance(instance_name)
+    if db_inst:
+        line_id      = db_inst["bitrix_line_id"]
+        evo_instance = db_inst["evolution_instance"]
+        inst_label   = db_inst.get("label", instance_name)
+    else:
+        cfg_inst = get_instance_by_name(instance_name)
+        if not cfg_inst:
+            logger.warning("Webhook for unknown instance: %s", instance_name)
+            raise HTTPException(404, f"Instance '{instance_name}' not configured")
+        line_id      = cfg_inst.bitrix24_line_id
+        evo_instance = cfg_inst.evolution_instance
+        inst_label   = cfg_inst.label
 
     payload: dict = await request.json()
 
@@ -94,7 +102,7 @@ async def evolution_webhook(
         return {"ok": True}
 
     data = payload.get("data", {})
-    key = data.get("key", {})
+    key  = data.get("key", {})
 
     # Ignore own messages and group chats
     if key.get("fromMe"):
@@ -103,36 +111,36 @@ async def evolution_webhook(
     if "@g.us" in remote_jid:
         return {"ok": True}
 
-    wa_phone = remote_jid.split("@")[0]
-    push_name = data.get("pushName") or wa_phone
+    wa_phone   = remote_jid.split("@")[0]
+    push_name  = data.get("pushName") or wa_phone
     message_id = key.get("id", "")
-    message = data.get("message", {})
+    message    = data.get("message", {})
 
     text, media_info = _parse_wa_message(message)
 
     if not text and not media_info:
         logger.warning(
             "[%s] Unsupported WA msg from %s: %s",
-            inst.name, wa_phone, list(message.keys()),
+            instance_name, wa_phone, list(message.keys()),
         )
         return {"ok": True}
 
     logger.info(
         "[%s] WA→Bitrix | %s (%s): %s",
-        inst.name, wa_phone, push_name,
+        instance_name, wa_phone, push_name,
         (text[:80] if text else "[media]"),
     )
     bg.add_task(
         _forward_to_bitrix,
-        inst.name,
-        inst.evolution_instance,
-        inst.bitrix24_line_id,
+        instance_name,
+        evo_instance,
+        line_id,
         wa_phone,
         push_name,
         message_id,
         text,
         media_info,
-        key,  # pass original key for media download
+        key,
     )
     return {"ok": True}
 
@@ -143,7 +151,7 @@ def _parse_wa_message(msg: dict) -> tuple[str, dict | None]:
     Returns (text, media_info) where media_info is None for text-only messages
     or {"type": "image"|"video"|"audio"|"document"|"sticker", "name": "...", "mime": "..."}.
     """
-    text = ""
+    text  = ""
     media = None
 
     if "conversation" in msg:
@@ -151,14 +159,14 @@ def _parse_wa_message(msg: dict) -> tuple[str, dict | None]:
     elif "extendedTextMessage" in msg:
         text = msg["extendedTextMessage"].get("text", "")
     elif "imageMessage" in msg:
-        text = msg["imageMessage"].get("caption", "")
+        text  = msg["imageMessage"].get("caption", "")
         media = {
             "type": "image",
             "name": "image.jpg",
             "mime": msg["imageMessage"].get("mimetype", "image/jpeg"),
         }
     elif "videoMessage" in msg:
-        text = msg["videoMessage"].get("caption", "")
+        text  = msg["videoMessage"].get("caption", "")
         media = {
             "type": "video",
             "name": "video.mp4",
@@ -171,14 +179,12 @@ def _parse_wa_message(msg: dict) -> tuple[str, dict | None]:
             "mime": msg["audioMessage"].get("mimetype", "audio/ogg"),
         }
     elif "documentMessage" in msg:
-        text = msg["documentMessage"].get("caption", "")
+        text  = msg["documentMessage"].get("caption", "")
         fname = msg["documentMessage"].get("fileName", "document")
         media = {
             "type": "document",
             "name": fname,
-            "mime": msg["documentMessage"].get(
-                "mimetype", "application/octet-stream"
-            ),
+            "mime": msg["documentMessage"].get("mimetype", "application/octet-stream"),
         }
     elif "stickerMessage" in msg:
         media = {"type": "sticker", "name": "sticker.webp", "mime": "image/webp"}
@@ -200,13 +206,10 @@ async def _forward_to_bitrix(
     """Download media (if any), then forward to Bitrix24."""
     files: list[dict] = []
 
-    # Download media from Evolution and save locally
     if media_info:
         try:
-            media_bytes = await evolution.get_media_base64(
-                evo_instance, message_key,
-            )
-            ext = _ext_from_name(media_info["name"])
+            media_bytes = await evolution.get_media_base64(evo_instance, message_key)
+            ext      = _ext_from_name(media_info["name"])
             filename = f"{uuid4().hex}.{ext}"
             file_path = MEDIA_DIR / filename
             file_path.write_bytes(media_bytes)
@@ -267,10 +270,8 @@ def _capture_chat_id(
     chat_id = ""
 
     if isinstance(chat_id_raw, dict):
-        # Map format: {"5511999991111": 123}
         chat_id = str(chat_id_raw.get(wa_phone, ""))
     elif chat_id_raw is not None:
-        # Direct format: CHAT_ID = 123
         chat_id = str(chat_id_raw)
 
     if chat_id:
@@ -288,14 +289,11 @@ def _capture_chat_id(
 
 # ════════════════════════════════════════════════════════════════════════════
 # 2.  Bitrix24 event  →  Evolution API (WhatsApp)
-#
-#     Bitrix24 sends OnImConnectorMessageAdd as form-encoded (PHP arrays)
-#     or occasionally JSON.  We handle both.
 # ════════════════════════════════════════════════════════════════════════════
 
 @app.post("/webhook/bitrix")
 async def bitrix_webhook(request: Request, bg: BackgroundTasks):
-    body = await request.body()
+    body    = await request.body()
     payload = _parse_bitrix_payload(body)
 
     logger.info(
@@ -304,7 +302,6 @@ async def bitrix_webhook(request: Request, bg: BackgroundTasks):
         list(payload.keys()),
     )
 
-    # Validate application_token
     app_token = (
         payload.get("auth", {}).get("application_token", "")
         if isinstance(payload.get("auth"), dict)
@@ -318,7 +315,7 @@ async def bitrix_webhook(request: Request, bg: BackgroundTasks):
         raise HTTPException(403, "Invalid application_token")
 
     event = str(payload.get("event", "")).upper()
-    data = payload.get("data", {})
+    data  = payload.get("data", {})
     if not isinstance(data, dict):
         return {"ok": True}
 
@@ -332,14 +329,11 @@ async def bitrix_webhook(request: Request, bg: BackgroundTasks):
 
 def _parse_bitrix_payload(body: bytes) -> dict:
     """Parse Bitrix24 webhook payload (JSON or PHP-style form-encoded)."""
-    # Try JSON first
     try:
         return json.loads(body)
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Parse form-encoded with PHP array notation:
-    # data[MESSAGES][0][im][chat_id]=123  →  {"data":{"MESSAGES":[{"im":{"chat_id":"123"}}]}}
     flat = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
     result: dict = {}
     for compound_key, values in sorted(flat.items()):
@@ -353,7 +347,7 @@ def _parse_bitrix_payload(body: bytes) -> dict:
 def _nested_set(d, keys: list[str], value):
     """Set a value in a nested dict/list structure from a key path."""
     for i, key in enumerate(keys[:-1]):
-        next_key = keys[i + 1]
+        next_key    = keys[i + 1]
         next_is_idx = next_key.isdigit()
 
         if key.isdigit():
@@ -378,13 +372,9 @@ def _nested_set(d, keys: list[str], value):
 
 
 async def _forward_to_whatsapp(data: dict):
-    """
-    Forward a Bitrix24 agent reply to WhatsApp.
-    Handles the OnImConnectorMessageAdd event data structure:
-        data.CONNECTOR, data.LINE, data.MESSAGES[n].{im, message, chat}
-    """
+    """Forward a Bitrix24 agent reply to WhatsApp."""
     try:
-        line_id = str(data.get("LINE", ""))
+        line_id  = str(data.get("LINE", ""))
         messages = data.get("MESSAGES", [])
 
         if not isinstance(messages, list) or not messages:
@@ -395,27 +385,25 @@ async def _forward_to_whatsapp(data: dict):
             if not isinstance(msg_block, dict):
                 continue
 
-            im = msg_block.get("im", {})
+            im             = msg_block.get("im", {})
             if not isinstance(im, dict):
                 im = {}
             bitrix_chat_id = str(im.get("chat_id", ""))
-            bitrix_msg_id = str(im.get("message_id", ""))
+            bitrix_msg_id  = str(im.get("message_id", ""))
 
             msg_content = msg_block.get("message", {})
             if not isinstance(msg_content, dict):
                 msg_content = {}
-            text = str(msg_content.get("text", ""))
+            text  = str(msg_content.get("text", ""))
             files = msg_content.get("files", []) or []
             if not isinstance(files, list):
                 files = []
 
-            # wa_chat_id = external chat ID (the wa_phone we set)
             chat_block = msg_block.get("chat", {})
             if not isinstance(chat_block, dict):
                 chat_block = {}
             wa_chat_id = str(chat_block.get("id", ""))
 
-            # Resolve WA phone and instance
             wa_phone, instance_name, evo_instance = _resolve_destination(
                 bitrix_chat_id, wa_chat_id, line_id,
             )
@@ -432,22 +420,19 @@ async def _forward_to_whatsapp(data: dict):
                 (text[:80] if text else "[media]"),
             )
 
-            # Send text
             if text:
                 await evolution.send_text(evo_instance, wa_phone, text)
 
-            # Send files
             for f in files:
                 if not isinstance(f, dict):
                     continue
-                url = f.get("link") or f.get("url", "")
+                url  = f.get("link") or f.get("url", "")
                 name = f.get("name", "file")
                 mime = f.get("type", "")
                 if not url:
                     continue
                 await _send_file_to_wa(evo_instance, wa_phone, url, name, mime)
 
-            # Confirm delivery to Bitrix24
             if line_id and bitrix_msg_id:
                 try:
                     await bitrix.delivery_status(
@@ -467,17 +452,27 @@ def _resolve_destination(
     """
     Resolve (wa_phone, instance_name, evolution_instance) from available info.
     Priority: session lookup by chat_id > event chat.id + line lookup.
+    Checks DB (instance_lines) first, then instances.json (legacy fallback).
     """
-    # Primary: look up by Bitrix chat_id in our saved sessions
     if bitrix_chat_id:
         session = storage.get_session_by_chat(bitrix_chat_id)
         if session:
-            inst = get_instance_by_name(session["instance_name"])
+            iname = session["instance_name"]
+            # DB first
+            db_inst = storage.get_line_by_instance(iname)
+            if db_inst:
+                return session["wa_phone"], db_inst["instance_name"], db_inst["evolution_instance"]
+            # Legacy config
+            inst = get_instance_by_name(iname)
             if inst:
                 return session["wa_phone"], inst.name, inst.evolution_instance
 
-    # Fallback: use chat.id as wa_phone + resolve instance from LINE
     if wa_chat_id and line_id:
+        # DB first
+        db_inst = storage.get_instance_by_line_db(line_id)
+        if db_inst:
+            return wa_chat_id, db_inst["instance_name"], db_inst["evolution_instance"]
+        # Legacy config
         inst = get_instance_by_line(line_id)
         if inst:
             return wa_chat_id, inst.name, inst.evolution_instance
@@ -488,7 +483,6 @@ def _resolve_destination(
 async def _send_file_to_wa(
     instance: str, phone: str, url: str, name: str, mime: str,
 ):
-    """Route a file to the correct Evolution API method based on MIME or extension."""
     mime_lower = mime.lower()
     ext = _ext_from_name(name)
 
@@ -503,13 +497,11 @@ async def _send_file_to_wa(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 3.  Media proxy  (serve downloaded WA media to Bitrix24)
+# 3.  Media proxy
 # ════════════════════════════════════════════════════════════════════════════
 
 @app.get("/media/{filename}")
 async def serve_media(filename: str):
-    """Serve a media file downloaded from WhatsApp."""
-    # Sanitize filename to prevent path traversal
     safe = Path(filename).name
     path = MEDIA_DIR / safe
     if not path.exists() or not path.is_file():
@@ -522,7 +514,6 @@ def _ext_from_name(name: str) -> str:
 
 
 def _cleanup_old_media(max_age_seconds: int = 86400):
-    """Delete media files older than max_age_seconds (default 24h)."""
     cutoff = time.time() - max_age_seconds
     try:
         for f in MEDIA_DIR.iterdir():
@@ -540,7 +531,7 @@ def _cleanup_old_media(max_age_seconds: int = 86400):
 @app.get("/bitrix/install")
 async def bitrix_install(request: Request):
     if request.method == "POST":
-        raw = await request.form()
+        raw     = await request.form()
         payload = dict(raw)
     else:
         payload = dict(request.query_params)
@@ -561,8 +552,8 @@ async def bitrix_install(request: Request):
     server_endpoint = payload.get("SERVER_ENDPOINT") or ""
     # DOMAIN is the portal hostname (e.g. motoclube.bitrix24.com.br)
     portal_domain = payload.get("DOMAIN") or auth.get("domain") or ""
-    member_id = payload.get("member_id") or payload.get("MEMBER_ID", "")
-    domain = server_endpoint  # keep existing column pointing to REST endpoint
+    member_id     = payload.get("member_id") or payload.get("MEMBER_ID", "")
+    domain        = server_endpoint  # keep legacy column pointing to REST endpoint
 
     if access_token and server_endpoint:
         storage.save_oauth(
@@ -587,7 +578,7 @@ async def bitrix_install(request: Request):
             "<h2 style='color:#10b981'>WhatsApp Bridge instalado!</h2>"
             "<p>Abra a <b>UI do conector</b> na Linha Aberta para configurar.</p>"
             "<p style='margin-top:20px;color:#9ca3af;font-size:13px'>"
-            "Ou execute <code>POST /setup</code> manualmente.</p>"
+            "Ou acesse <code>/bitrix/connector-ui</code> para vincular instancias.</p>"
             "<script>if(typeof BX24!=='undefined')BX24.init(function(){});</script>"
             "</body></html>"
         )
@@ -617,32 +608,87 @@ async def connector_ui():
 
 # ─── API endpoints for the front-end ────────────────────────────────────────
 
+@app.get("/api/evolution/instances")
+async def api_evolution_instances():
+    """
+    List ALL real instances from the Evolution API server.
+    Used by the UI to let the user choose which ones to link to Bitrix24.
+    """
+    try:
+        raw = await evolution.list_instances()
+    except Exception as exc:
+        logger.error("Failed to list Evolution instances: %s", exc)
+        raise HTTPException(502, f"Evolution API error: {exc}")
+
+    result = []
+    for item in raw:
+        # Normalize: Evolution v2 may nest under "instance" key
+        inst = item.get("instance", item) if isinstance(item, dict) else {}
+        name         = inst.get("instanceName") or inst.get("name", "")
+        state        = inst.get("connectionStatus") or inst.get("state", "unknown")
+        owner_jid    = inst.get("ownerJid", "")
+        number       = owner_jid.split("@")[0] if owner_jid else ""
+        profile_name = inst.get("profileName", "")
+        if name:
+            result.append({
+                "name":        name,
+                "status":      state,
+                "number":      number,
+                "profileName": profile_name,
+                "connected":   state in ("open", "connected"),
+            })
+
+    return result
+
+
 @app.get("/api/instances")
 async def api_list_instances():
-    """List all instances with their Evolution connection status."""
-    instances = get_instances()
+    """
+    List CONFIGURED instances (those linked via /setup) with their Evolution status.
+    Falls back to instances.json if DB is empty (legacy mode).
+    """
+    db_instances = storage.get_instance_lines()
+
+    # Fallback to instances.json if nothing configured via setup yet
+    if not db_instances:
+        cfg = get_instances()
+        db_instances = [
+            {
+                "instance_name":      i.name,
+                "evolution_instance": i.evolution_instance,
+                "bitrix_line_id":     i.bitrix24_line_id,
+                "label":              i.label,
+            }
+            for i in cfg
+        ]
+
     result = []
-    for inst in instances:
+    for inst in db_instances:
         status = "unknown"
         try:
-            info = await evolution.get_instance_status(inst.evolution_instance)
-            # Evolution returns a list; first item has instance state
+            info = await evolution.get_instance_status(inst["evolution_instance"])
             if isinstance(info, list) and info:
-                state_info = info[0].get("instance", {})
-                status = state_info.get("state", "unknown")
+                item = info[0]
+                state_info = item.get("instance", item)
             elif isinstance(info, dict):
-                status = info.get("instance", {}).get("state", "unknown")
+                state_info = info.get("instance", info)
+            else:
+                state_info = {}
+            status = (
+                state_info.get("connectionStatus")
+                or state_info.get("state", "unknown")
+            )
         except Exception as exc:
             logger.warning(
-                "Could not get status for %s: %s", inst.evolution_instance, exc,
+                "Could not get status for %s: %s", inst["evolution_instance"], exc,
             )
 
         result.append({
-            "name": inst.name,
-            "label": inst.label,
-            "evolution_instance": inst.evolution_instance,
-            "line_id": inst.bitrix24_line_id,
-            "status": status,
+            "name":               inst["instance_name"],
+            "label":              inst.get("label") or inst["instance_name"],
+            "evolution_instance": inst["evolution_instance"],
+            "line_id":            inst["bitrix_line_id"],
+            "status":             status,
         })
     return result
 
@@ -650,25 +696,35 @@ async def api_list_instances():
 @app.get("/api/instances/{instance_name}/qr")
 async def api_instance_qr(instance_name: str):
     """Get QR code for connecting a WhatsApp instance."""
-    inst = get_instance_by_name(instance_name)
-    if not inst:
-        raise HTTPException(404, f"Instance '{instance_name}' not found")
+    # Resolve evolution instance name: DB → instances.json → use name directly
+    db_inst = storage.get_line_by_instance(instance_name)
+    if db_inst:
+        evo_instance = db_inst["evolution_instance"]
+    else:
+        cfg_inst = get_instance_by_name(instance_name)
+        if cfg_inst:
+            evo_instance = cfg_inst.evolution_instance
+        else:
+            # Try using the name directly as the Evolution instance name
+            evo_instance = instance_name
 
     try:
-        data = await evolution.connect_instance(inst.evolution_instance)
+        data = await evolution.connect_instance(evo_instance)
 
-        # If already connected
         if isinstance(data, dict):
-            state = data.get("instance", {}).get("state", "")
+            state_info = data.get("instance", data)
+            state = state_info.get("state") or state_info.get("connectionStatus", "")
             if state == "open":
                 return {"connected": True, "status": "open"}
 
-            # QR code available
             b64 = data.get("base64", "")
             if b64:
                 return {"connected": False, "base64": b64}
 
-        return {"connected": False, "error": "QR code nao disponivel. Verifique a instancia na Evolution API."}
+        return {
+            "connected": False,
+            "error":     "QR code nao disponivel. Verifique a instancia na Evolution API.",
+        }
 
     except Exception as exc:
         logger.error("QR code request failed for %s: %s", instance_name, exc)
@@ -676,69 +732,183 @@ async def api_instance_qr(instance_name: str):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 6.  Setup (run once after install)
+# 6.  Setup — link Evolution instances to Bitrix24
 # ════════════════════════════════════════════════════════════════════════════
 
 @app.post("/setup")
-async def run_setup():
+async def run_setup(request: Request):
     """
-    Run once after installing the app in Bitrix24.
-    - Registers connector (once)
-    - Activates it on EACH open line
-    - Binds the event handler (idempotent)
-    - Configures Evolution webhook for EACH instance
+    Link selected Evolution instances to Bitrix24 Open Lines.
+
+    Body (JSON):
+        {"instances": ["instance_name_1", "instance_name_2", ...]}
+
+    Steps per instance:
+        1. register_connector (once)
+        2. bind_events (once)
+        3. For each instance:
+           a. create Open Line in Bitrix24 (imopenlines.config.add)
+           b. activate connector on that line (imconnector.activate)
+           c. set Evolution webhook pointing to /webhook/evolution/{name}
+        4. Persist instance → line_id mapping in SQLite
     """
-    results: dict = {}
-    instances = get_instances()
-
-    # 1. Register connector
     try:
-        results["1_register_connector"] = await bitrix.register_connector()
-    except Exception as exc:
-        results["1_register_connector"] = {"error": str(exc)}
+        body = await request.json()
+        selected = body.get("instances", [])
+    except Exception:
+        selected = []
 
-    # 2. Activate per line
-    for inst in instances:
-        key = f"2_activate_{inst.name}_line_{inst.bitrix24_line_id}"
-        try:
-            results[key] = await bitrix.activate_connector(inst.bitrix24_line_id)
-        except Exception as exc:
-            results[key] = {"error": str(exc)}
+    if not selected:
+        raise HTTPException(
+            400, "No instances selected. Send JSON: {\"instances\": [\"name1\", ...]}"
+        )
 
-    # 3. Bind events (idempotent — checks for existing bindings)
+    oauth = storage.get_oauth()
+    if not oauth:
+        raise HTTPException(
+            400, "Bitrix24 not authenticated. Install the local app first."
+        )
+    if not oauth.get("server_endpoint"):
+        raise HTTPException(
+            400,
+            "server_endpoint not set. Re-install the Bitrix24 app "
+            "so SERVER_ENDPOINT is captured correctly."
+        )
+
+    steps = []
+
+    # ── Step 1: Register connector (once) ──────────────────────────────────
+    step: dict = {"name": "register_connector", "ok": False}
     try:
-        results["3_bind_events"] = await bitrix.bind_events()
+        step["details"] = await bitrix.register_connector()
+        step["ok"] = True
     except Exception as exc:
-        results["3_bind_events"] = {"error": str(exc)}
+        step["error"] = str(exc)
+    steps.append(step)
 
-    # 4. Configure Evolution webhook per instance
-    for inst in instances:
-        key = f"4_evolution_webhook_{inst.name}"
-        webhook_url = f"{settings.app_url}/webhook/evolution/{inst.name}"
+    # ── Step 2: Bind events (once) ─────────────────────────────────────────
+    step = {"name": "bind_events", "ok": False}
+    try:
+        step["details"] = await bitrix.bind_events()
+        step["ok"] = True
+    except Exception as exc:
+        step["error"] = str(exc)
+    steps.append(step)
+
+    # ── Step 3: Per instance ───────────────────────────────────────────────
+    for inst_name in selected:
+        line_id: str | None = None
+
+        # 3a: Create or reuse Open Line
+        step = {"name": "create_line", "instance": inst_name, "ok": False}
+        existing = storage.get_line_by_instance(inst_name)
+        if existing:
+            line_id       = existing["bitrix_line_id"]
+            step["ok"]    = True
+            step["line_id"] = line_id
+            step["reused"] = True
+            logger.info("[%s] Reusing existing line_id=%s", inst_name, line_id)
+        else:
+            line_name = f"WhatsApp - {inst_name}"
+            try:
+                line_id = await bitrix.create_open_line(line_name)
+                storage.save_instance_line(inst_name, inst_name, line_id, line_name)
+                step["ok"]      = True
+                step["line_id"] = line_id
+                step["created"] = True
+                logger.info("[%s] Created line_id=%s", inst_name, line_id)
+            except Exception as exc:
+                step["error"] = str(exc)
+                logger.error("[%s] create_open_line failed: %s", inst_name, exc)
+        steps.append(step)
+
+        # 3b: Activate connector on line
+        if line_id:
+            step = {
+                "name":     "activate_line",
+                "instance": inst_name,
+                "line_id":  line_id,
+                "ok":       False,
+            }
+            try:
+                step["details"] = await bitrix.activate_connector(line_id)
+                step["ok"] = True
+            except Exception as exc:
+                step["error"] = str(exc)
+            steps.append(step)
+
+        # 3c: Set Evolution webhook
+        webhook_url = f"{settings.app_url}/webhook/evolution/{inst_name}"
+        step = {
+            "name":     "set_evolution_webhook",
+            "instance": inst_name,
+            "url":      webhook_url,
+            "ok":       False,
+        }
         try:
-            results[key] = await evolution.set_webhook(
-                inst.evolution_instance, webhook_url,
-            )
+            step["details"] = await evolution.set_webhook(inst_name, webhook_url)
+            step["ok"] = True
         except Exception as exc:
-            results[key] = {"error": str(exc)}
+            step["error"] = str(exc)
+            logger.error("[%s] set_webhook failed: %s", inst_name, exc)
+        steps.append(step)
 
-    return results
+    all_ok = all(s["ok"] for s in steps)
+    return {"ok": all_ok, "steps": steps}
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # 7.  Health & Debug
 # ════════════════════════════════════════════════════════════════════════════
 
+def _dns_check(hostname: str) -> dict:
+    """Try to resolve hostname via DNS. Returns {ok, ip} or {ok, error}."""
+    try:
+        ip = socket.gethostbyname(hostname)
+        return {"ok": True, "ip": ip}
+    except socket.gaierror as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 @app.get("/health")
 async def health():
-    oauth = storage.get_oauth()
-    instances = get_instances()
+    oauth     = storage.get_oauth()
+    instances = storage.get_instance_lines()
+
+    # Fallback to instances.json if DB is empty
+    if not instances:
+        instances = [
+            {
+                "instance_name":  i.name,
+                "label":          i.label,
+                "bitrix_line_id": i.bitrix24_line_id,
+            }
+            for i in get_instances()
+        ]
+
+    portal_domain = (oauth.get("portal_domain") if oauth else "") or ""
+    rest_endpoint = (oauth.get("server_endpoint") if oauth else "") or ""
+
+    # DNS diagnostics — catches Errno -3 before any actual API call
+    dns: dict = {}
+    for host in ["oauth.bitrix.info"] + ([portal_domain] if portal_domain else []):
+        dns[host] = _dns_check(host)
+
+    evo_host = settings.evolution_api_url.split("//")[-1].split("/")[0]
+    dns[evo_host] = _dns_check(evo_host)
+
     return {
-        "status": "ok",
+        "status":        "ok",
         "bitrix_authed": oauth is not None,
-        "bitrix_domain": (oauth.get("portal_domain") or None) if oauth else None,
+        "bitrix_domain": portal_domain or None,
+        "rest_endpoint": rest_endpoint or None,
+        "dns":           dns,
         "instances": [
-            {"name": i.name, "label": i.label, "line_id": i.bitrix24_line_id}
+            {
+                "name":    i.get("instance_name", i.get("name", "")),
+                "label":   i.get("label", ""),
+                "line_id": i.get("bitrix_line_id", i.get("line_id", "")),
+            }
             for i in instances
         ],
     }
@@ -747,7 +917,7 @@ async def health():
 @app.post("/debug/bitrix")
 async def debug_bitrix(request: Request):
     """Log the raw Bitrix24 event for debugging."""
-    body = await request.body()
+    body    = await request.body()
     payload = _parse_bitrix_payload(body)
     logger.info(
         "DEBUG BITRIX:\n%s",

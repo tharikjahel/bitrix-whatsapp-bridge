@@ -25,8 +25,8 @@
 
   .badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; }
   .badge::before { content: ''; width: 8px; height: 8px; border-radius: 50%; }
-  .badge.open { background: #d1fae5; color: #065f46; }
-  .badge.open::before { background: #10b981; }
+  .badge.open, .badge.connected { background: #d1fae5; color: #065f46; }
+  .badge.open::before, .badge.connected::before { background: #10b981; }
   .badge.close { background: #f3f4f6; color: #6b7280; }
   .badge.close::before { background: #9ca3af; }
   .badge.connecting { background: #fef3c7; color: #92400e; }
@@ -38,10 +38,23 @@
   .btn:hover { filter: brightness(.95); }
   .btn:disabled { opacity: .5; cursor: not-allowed; }
   .btn-primary { background: #25D366; color: #fff; }
+  .btn-blue { background: #2563eb; color: #fff; }
   .btn-outline { background: #fff; color: #374151; border: 1px solid #d1d5db; }
   .btn-sm { padding: 5px 10px; font-size: 12px; }
 
   .code { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; background: #f9fafb; padding: 2px 6px; border-radius: 4px; }
+
+  /* Evolution instance selection */
+  .evo-list { display: flex; flex-direction: column; gap: 8px; }
+  .evo-item { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 8px; cursor: pointer; transition: background .1s; }
+  .evo-item:hover { background: #f9fafb; }
+  .evo-item.selected { border-color: #25D366; background: #f0fdf4; }
+  .evo-item input[type=checkbox] { width: 16px; height: 16px; cursor: pointer; accent-color: #25D366; }
+  .evo-item-info { flex: 1; }
+  .evo-item-name { font-weight: 600; font-size: 14px; }
+  .evo-item-sub { font-size: 12px; color: #6b7280; margin-top: 2px; }
+  .evo-actions { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+  .evo-count { font-size: 13px; color: #6b7280; }
 
   /* Modal */
   .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 100; align-items: center; justify-content: center; }
@@ -60,9 +73,15 @@
   #toast.success { background: #059669; }
 
   /* Setup result */
-  .setup-result { margin-top: 12px; font-size: 13px; max-height: 200px; overflow: auto; }
-  .setup-result .ok { color: #059669; }
-  .setup-result .fail { color: #dc2626; }
+  .setup-result { margin-top: 12px; font-size: 13px; max-height: 300px; overflow: auto; display: flex; flex-direction: column; gap: 6px; }
+  .step-row { display: flex; gap: 8px; align-items: flex-start; padding: 6px 8px; border-radius: 6px; background: #f9fafb; }
+  .step-row.ok { background: #f0fdf4; }
+  .step-row.fail { background: #fef2f2; }
+  .step-icon { font-size: 14px; flex-shrink: 0; margin-top: 1px; }
+  .step-body { flex: 1; }
+  .step-name { font-weight: 600; }
+  .step-detail { color: #6b7280; font-size: 12px; margin-top: 2px; }
+  .step-detail.fail { color: #dc2626; }
 
   .empty { text-align: center; padding: 40px 20px; color: #9ca3af; }
   .empty p { margin-top: 8px; font-size: 14px; }
@@ -78,18 +97,33 @@
 <div class="header">
   <h1>WhatsApp Evolution</h1>
   <div class="header-actions">
-    <button class="btn btn-outline" onclick="runSetup()" id="btn-setup">Executar Setup</button>
-    <button class="btn btn-primary" onclick="loadInstances()">Atualizar</button>
+    <button class="btn btn-outline" onclick="loadEvoInstances()">&#8635; Atualizar</button>
   </div>
 </div>
 
+<!-- Card 1: Evolution instances (select to link) -->
 <div class="card">
-  <h2>Instancias</h2>
+  <h2>Instancias da Evolution</h2>
+  <div id="evo-container">
+    <div class="empty"><p>Carregando instancias...</p></div>
+  </div>
+  <div class="evo-actions" id="evo-actions" style="display:none">
+    <span class="evo-count" id="evo-count">0 selecionadas</span>
+    <button class="btn btn-blue" id="btn-link" onclick="linkSelected()" disabled>
+      Vincular ao Bitrix
+    </button>
+  </div>
+</div>
+
+<!-- Card 2: Configured instances (linked via setup) -->
+<div class="card">
+  <h2>Instancias Vinculadas</h2>
   <div id="instances-container">
     <div class="empty"><p>Carregando...</p></div>
   </div>
 </div>
 
+<!-- Card 3: Setup result -->
 <div id="setup-card" class="card" style="display:none">
   <h2>Resultado do Setup</h2>
   <div id="setup-result" class="setup-result"></div>
@@ -110,7 +144,6 @@
 
 <div id="toast"></div>
 
-<!-- BX24 JS SDK (funciona dentro do iframe do Bitrix24; falha silenciosamente fora) -->
 <script>
 (function(){
   var s = document.createElement('script');
@@ -118,7 +151,7 @@
   s.onload = function(){
     if(typeof BX24!=='undefined') BX24.init(function(){ BX24.fitWindow(); });
   };
-  s.onerror = function(){}; // Ignora fora do Bitrix24
+  s.onerror = function(){};
   document.head.appendChild(s);
 })();
 </script>
@@ -126,44 +159,138 @@
 <script>
 const BASE = window.location.origin;
 let _qrTimer = null;
+let _evoInstances = [];  // raw list from /api/evolution/instances
 
-// ─── Instances ──────────────────────────────────────────────────────────────
+// ─── Evolution Instances (Card 1) ───────────────────────────────────────────
 
-async function loadInstances() {
+async function loadEvoInstances() {
+  document.getElementById('evo-container').innerHTML = '<div class="empty"><p>Carregando...</p></div>';
+  document.getElementById('evo-actions').style.display = 'none';
+  try {
+    const r = await fetch(BASE + '/api/evolution/instances');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    _evoInstances = await r.json();
+    renderEvoInstances(_evoInstances);
+  } catch(e) {
+    document.getElementById('evo-container').innerHTML =
+      '<div class="empty"><p style="color:#dc2626">Erro ao conectar na Evolution API: ' + esc(e.message) + '</p></div>';
+    toast('Erro ao carregar instancias da Evolution: ' + e.message, 'error');
+  }
+  loadLinkedInstances();
+}
+
+function renderEvoInstances(list) {
+  const el = document.getElementById('evo-container');
+  if (!list.length) {
+    el.innerHTML = '<div class="empty"><p>Nenhuma instancia encontrada na Evolution API.</p></div>';
+    return;
+  }
+  el.innerHTML = '<div class="evo-list">' + list.map(renderEvoItem).join('') + '</div>';
+  document.getElementById('evo-actions').style.display = 'flex';
+  updateLinkButton();
+}
+
+function renderEvoItem(inst) {
+  const statusText = {open:'Conectado', connected:'Conectado', close:'Desconectado', connecting:'Conectando...'}[inst.status] || inst.status || 'Desconhecido';
+  const sub = [inst.number ? '&#128222; ' + esc(inst.number) : '', inst.profileName ? esc(inst.profileName) : ''].filter(Boolean).join(' &bull; ') || '&mdash;';
+  return `<label class="evo-item" id="evo-${esc(inst.name)}">
+    <input type="checkbox" value="${esc(inst.name)}" onchange="onEvoCheck(this)">
+    <div class="evo-item-info">
+      <div class="evo-item-name">${esc(inst.name)}</div>
+      <div class="evo-item-sub">${sub}</div>
+    </div>
+    <span class="badge ${esc(inst.status)}">${statusText}</span>
+    <button class="btn btn-outline btn-sm" onclick="showQR('${esc(inst.name)}','${esc(inst.name)}');event.preventDefault()">QR</button>
+  </label>`;
+}
+
+function onEvoCheck(cb) {
+  const item = cb.closest('.evo-item');
+  if (cb.checked) item.classList.add('selected');
+  else item.classList.remove('selected');
+  updateLinkButton();
+}
+
+function updateLinkButton() {
+  const checked = document.querySelectorAll('.evo-list input[type=checkbox]:checked');
+  const btn     = document.getElementById('btn-link');
+  const count   = document.getElementById('evo-count');
+  btn.disabled  = checked.length === 0;
+  count.textContent = checked.length + ' selecionada' + (checked.length !== 1 ? 's' : '');
+}
+
+function getSelectedInstances() {
+  return Array.from(
+    document.querySelectorAll('.evo-list input[type=checkbox]:checked')
+  ).map(cb => cb.value);
+}
+
+async function linkSelected() {
+  const selected = getSelectedInstances();
+  if (!selected.length) { toast('Selecione ao menos uma instancia.', 'error'); return; }
+
+  const btn = document.getElementById('btn-link');
+  btn.disabled = true;
+  btn.textContent = 'Vinculando...';
+  toast('Executando setup...');
+
+  try {
+    const r = await fetch(BASE + '/setup', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({instances: selected}),
+    });
+    const data = await r.json();
+    showSetupResult(data);
+    await loadLinkedInstances();
+    const allOk = data.ok;
+    toast(allOk ? 'Setup concluido com sucesso!' : 'Setup concluido com erros. Veja o resultado.', allOk ? 'success' : 'error');
+  } catch(e) {
+    toast('Erro no setup: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Vincular ao Bitrix';
+    updateLinkButton();
+  }
+}
+
+// ─── Linked Instances (Card 2) ───────────────────────────────────────────────
+
+async function loadLinkedInstances() {
   try {
     const r = await fetch(BASE + '/api/instances');
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
-    renderInstances(data);
+    renderLinkedInstances(data);
   } catch(e) {
-    toast('Erro ao carregar: ' + e.message, 'error');
+    document.getElementById('instances-container').innerHTML =
+      '<div class="empty"><p style="color:#dc2626">Erro: ' + esc(e.message) + '</p></div>';
   }
 }
 
-function renderInstances(list) {
+function renderLinkedInstances(list) {
   const el = document.getElementById('instances-container');
   if (!list.length) {
-    el.innerHTML = '<div class="empty"><p>Nenhuma instancia configurada.<br>Edite <span class="code">instances.json</span> e reinicie o app.</p></div>';
+    el.innerHTML = '<div class="empty"><p>Nenhuma instancia vinculada ainda.<br>Selecione instancias acima e clique em <b>Vincular ao Bitrix</b>.</p></div>';
     return;
   }
   el.innerHTML = `
     <table>
       <thead><tr><th>Instancia</th><th>Evolution</th><th>Linha</th><th>Status</th><th>Acoes</th></tr></thead>
-      <tbody>${list.map(renderRow).join('')}</tbody>
+      <tbody>${list.map(renderLinkedRow).join('')}</tbody>
     </table>`;
 }
 
-function renderRow(i) {
+function renderLinkedRow(i) {
   const statusClass = i.status || 'unknown';
-  const statusText = {open:'Conectado', close:'Desconectado', connecting:'Conectando...'}[i.status] || i.status || 'Desconhecido';
-  const btnLabel = i.status === 'open' ? 'Reconectar' : 'Conectar';
-  const btnClass = i.status === 'open' ? 'btn-outline btn-sm' : 'btn-primary btn-sm';
+  const statusText = {open:'Conectado', connected:'Conectado', close:'Desconectado', connecting:'Conectando...'}[i.status] || i.status || 'Desconhecido';
+  const btnClass = (i.status === 'open' || i.status === 'connected') ? 'btn-outline btn-sm' : 'btn-primary btn-sm';
   return `<tr>
-    <td><div class="inst-name">${esc(i.label)}</div><div class="inst-sub">${esc(i.name)}</div></td>
+    <td><div class="inst-name">${esc(i.label || i.name)}</div><div class="inst-sub">${esc(i.name)}</div></td>
     <td><span class="code">${esc(i.evolution_instance)}</span></td>
     <td>${esc(i.line_id)}</td>
     <td><span class="badge ${statusClass}">${statusText}</span></td>
-    <td><button class="btn ${btnClass}" onclick="showQR('${esc(i.name)}','${esc(i.label)}')">${btnLabel}</button></td>
+    <td><button class="btn ${btnClass}" onclick="showQR('${esc(i.name)}','${esc(i.label || i.name)}')">Conectar QR</button></td>
   </tr>`;
 }
 
@@ -174,21 +301,20 @@ async function showQR(name, label) {
   document.getElementById('qr-box').innerHTML = '<p style="color:#9ca3af">Carregando QR Code...</p>';
   document.getElementById('qr-overlay').classList.add('show');
   await fetchQR(name);
-  // Auto-refresh QR a cada 20s (QR expira ~60s)
   clearInterval(_qrTimer);
   _qrTimer = setInterval(() => fetchQR(name), 20000);
 }
 
 async function fetchQR(name) {
   try {
-    const r = await fetch(BASE + '/api/instances/' + encodeURIComponent(name) + '/qr');
+    const r    = await fetch(BASE + '/api/instances/' + encodeURIComponent(name) + '/qr');
     const data = await r.json();
-    const box = document.getElementById('qr-box');
+    const box  = document.getElementById('qr-box');
 
     if (data.connected) {
-      box.innerHTML = '<p style="color:#10b981;font-size:18px;font-weight:600">Ja conectado!</p>';
+      box.innerHTML = '<p style="color:#10b981;font-size:18px;font-weight:600">&#10003; Ja conectado!</p>';
       clearInterval(_qrTimer);
-      setTimeout(() => { closeQR(); loadInstances(); }, 2000);
+      setTimeout(() => { closeQR(); loadEvoInstances(); }, 2000);
     } else if (data.base64) {
       const src = data.base64.startsWith('data:') ? data.base64 : 'data:image/png;base64,' + data.base64;
       box.innerHTML = '<img src="' + src + '" alt="QR Code">';
@@ -203,51 +329,42 @@ async function fetchQR(name) {
 function closeQR() {
   document.getElementById('qr-overlay').classList.remove('show');
   clearInterval(_qrTimer);
-  loadInstances();
+  loadLinkedInstances();
 }
 
-// ─── Setup ──────────────────────────────────────────────────────────────────
-
-async function runSetup() {
-  const btn = document.getElementById('btn-setup');
-  btn.disabled = true;
-  btn.textContent = 'Executando...';
-  toast('Executando setup...');
-
-  try {
-    const r = await fetch(BASE + '/setup', {method:'POST'});
-    const data = await r.json();
-    showSetupResult(data);
-    loadInstances();
-    toast('Setup concluido!', 'success');
-  } catch(e) {
-    toast('Erro no setup: ' + e.message, 'error');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Executar Setup';
-  }
-}
+// ─── Setup result ────────────────────────────────────────────────────────────
 
 function showSetupResult(data) {
   const card = document.getElementById('setup-card');
-  const el = document.getElementById('setup-result');
+  const el   = document.getElementById('setup-result');
   card.style.display = 'block';
 
-  const lines = Object.entries(data).map(([k, v]) => {
-    const hasError = v && v.error;
-    const cls = hasError ? 'fail' : 'ok';
-    const icon = hasError ? '&#10007;' : '&#10003;';
-    const detail = hasError ? v.error : 'OK';
-    return '<div class="' + cls + '">' + icon + ' <strong>' + esc(k) + '</strong>: ' + esc(String(detail)) + '</div>';
+  const steps = data.steps || Object.entries(data).map(([k, v]) => ({name: k, ok: !v?.error, ...v}));
+  const lines = steps.map(s => {
+    const ok    = s.ok;
+    const icon  = ok ? '&#10003;' : '&#10007;';
+    const sub   = s.instance ? (' &bull; instance: <b>' + esc(s.instance) + '</b>') : '';
+    const lineSub = s.line_id ? (' &bull; line_id: ' + esc(s.line_id)) : '';
+    const url   = s.url ? (' &bull; ' + esc(s.url)) : '';
+    const errDetail = s.error ? ('<div class="step-detail fail">' + esc(s.error) + '</div>') : '';
+    const okDetail  = (s.reused ? ' (linha existente reutilizada)' : '') + (s.created ? ' (nova linha criada)' : '');
+    return `<div class="step-row ${ok ? 'ok' : 'fail'}">
+      <div class="step-icon">${icon}</div>
+      <div class="step-body">
+        <div class="step-name">${esc(s.name)}${sub}${lineSub}${url}</div>
+        ${ok ? '<div class="step-detail">' + esc(okDetail || 'OK') + '</div>' : errDetail}
+      </div>
+    </div>`;
   });
   el.innerHTML = lines.join('');
+  card.scrollIntoView({behavior: 'smooth', block: 'start'});
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function esc(s) {
   const d = document.createElement('div');
-  d.textContent = s;
+  d.textContent = String(s ?? '');
   return d.innerHTML;
 }
 
@@ -257,13 +374,13 @@ function toast(msg, type) {
   t.className = type || '';
   t.style.display = 'block';
   clearTimeout(t._tid);
-  t._tid = setTimeout(() => t.style.display = 'none', 4000);
+  t._tid = setTimeout(() => t.style.display = 'none', 5000);
 }
 
-// ─── Init ───────────────────────────────────────────────────────────────────
+// ─── Init ────────────────────────────────────────────────────────────────────
 
-loadInstances();
-setInterval(loadInstances, 30000);
+loadEvoInstances();
+setInterval(loadLinkedInstances, 30000);
 </script>
 </body>
 </html>
