@@ -25,13 +25,21 @@ def init_db():
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS oauth_tokens (
-                id            INTEGER PRIMARY KEY CHECK (id = 1),
-                access_token  TEXT,
-                refresh_token TEXT,
-                expires_at    REAL,
-                domain        TEXT
+                id              INTEGER PRIMARY KEY CHECK (id = 1),
+                access_token    TEXT,
+                refresh_token   TEXT,
+                expires_at      REAL,
+                domain          TEXT,
+                member_id       TEXT,
+                server_endpoint TEXT
             )
         """)
+        # migrate existing databases that lack the new columns
+        for col_def in ("member_id TEXT", "server_endpoint TEXT"):
+            try:
+                conn.execute(f"ALTER TABLE oauth_tokens ADD COLUMN {col_def}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.commit()
 
 
@@ -82,20 +90,25 @@ def save_oauth(
     refresh_token: str,
     expires_in: int,
     domain: str,
+    member_id: str = "",
+    server_endpoint: str = "",
 ):
     expires_at = time.time() + int(expires_in)
     with _lock, sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
-            INSERT INTO oauth_tokens (id, access_token, refresh_token, expires_at, domain)
-            VALUES (1, ?, ?, ?, ?)
+            INSERT INTO oauth_tokens
+                (id, access_token, refresh_token, expires_at, domain, member_id, server_endpoint)
+            VALUES (1, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                access_token  = excluded.access_token,
-                refresh_token = excluded.refresh_token,
-                expires_at    = excluded.expires_at,
-                domain        = excluded.domain
+                access_token    = excluded.access_token,
+                refresh_token   = excluded.refresh_token,
+                expires_at      = excluded.expires_at,
+                domain          = excluded.domain,
+                member_id       = excluded.member_id,
+                server_endpoint = excluded.server_endpoint
             """,
-            (access_token, refresh_token, expires_at, domain),
+            (access_token, refresh_token, expires_at, domain, member_id, server_endpoint),
         )
         conn.commit()
 
@@ -103,14 +116,16 @@ def save_oauth(
 def get_oauth() -> dict | None:
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT access_token, refresh_token, expires_at, domain "
+            "SELECT access_token, refresh_token, expires_at, domain, member_id, server_endpoint "
             "FROM oauth_tokens WHERE id = 1"
         ).fetchone()
     if not row:
         return None
     return {
-        "access_token":  row[0],
-        "refresh_token": row[1],
-        "expires_at":    row[2],
-        "domain":        row[3],
+        "access_token":    row[0],
+        "refresh_token":   row[1],
+        "expires_at":      row[2],
+        "domain":          row[3],
+        "member_id":       row[4],
+        "server_endpoint": row[5],
     }

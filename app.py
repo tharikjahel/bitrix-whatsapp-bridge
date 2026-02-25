@@ -554,13 +554,23 @@ async def bitrix_install(request: Request):
         except Exception:
             auth = {}
 
-    access_token = auth.get("access_token") or payload.get("AUTH_ID", "")
+    access_token  = auth.get("access_token") or payload.get("AUTH_ID", "")
     refresh_token = auth.get("refresh_token") or payload.get("REFRESH_ID", "")
-    expires_in = int(auth.get("expires_in") or payload.get("AUTH_EXPIRES") or 3600)
-    domain = auth.get("domain") or payload.get("DOMAIN", "")
+    expires_in    = int(auth.get("expires_in") or payload.get("AUTH_EXPIRES") or 3600)
+    # Bitrix24 sends SERVER_ENDPOINT (not DOMAIN) in the install callback
+    server_endpoint = (
+        payload.get("SERVER_ENDPOINT")
+        or auth.get("domain")
+        or payload.get("DOMAIN", "")
+    )
+    member_id = payload.get("member_id") or payload.get("MEMBER_ID", "")
+    domain = server_endpoint  # store the REST endpoint as domain for API calls
 
-    if access_token and domain:
-        storage.save_oauth(access_token, refresh_token, expires_in, domain)
+    if access_token and server_endpoint:
+        storage.save_oauth(
+            access_token, refresh_token, expires_in, domain,
+            member_id=member_id, server_endpoint=server_endpoint,
+        )
         app_token = (
             auth.get("application_token") or payload.get("APPLICATION_TOKEN", "")
         )
@@ -569,7 +579,10 @@ async def bitrix_install(request: Request):
                 "application_token: %s — set BITRIX24_APPLICATION_TOKEN in .env",
                 app_token,
             )
-        logger.info("OAuth tokens saved for domain=%s", domain)
+        logger.info(
+            "Install OK: member_id=%s, endpoint=%s, expires_in=%s",
+            member_id, server_endpoint, expires_in,
+        )
         return HTMLResponse(
             "<html><body style='font-family:sans-serif;padding:40px;text-align:center'>"
             "<h2 style='color:#10b981'>WhatsApp Bridge instalado!</h2>"
@@ -580,7 +593,7 @@ async def bitrix_install(request: Request):
             "</body></html>"
         )
 
-    logger.warning("Install handler: tokens not found. Payload keys: %s", list(payload.keys()))
+    logger.warning("Install handler: tokens not found. Keys: %s", list(payload.keys()))
     return HTMLResponse(
         "<html><body style='font-family:sans-serif;padding:40px'>"
         "<h2 style='color:#dc2626'>Tokens nao encontrados</h2>"
