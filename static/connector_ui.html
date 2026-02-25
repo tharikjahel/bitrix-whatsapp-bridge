@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WhatsApp Evolution - Configuracao</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; background: #f4f5f7; color: #1f2937; padding: 20px; }
+
+  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; flex-wrap: wrap; gap: 12px; }
+  .header h1 { font-size: 20px; font-weight: 600; }
+  .header-actions { display: flex; gap: 8px; }
+
+  .card { background: #fff; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.08); padding: 20px; margin-bottom: 20px; }
+  .card h2 { font-size: 15px; font-weight: 600; color: #6b7280; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 16px; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; padding: 10px 12px; font-size: 12px; font-weight: 600; color: #9ca3af; text-transform: uppercase; letter-spacing: .5px; border-bottom: 2px solid #f3f4f6; }
+  td { padding: 14px 12px; border-bottom: 1px solid #f3f4f6; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+
+  .inst-name { font-weight: 600; font-size: 15px; }
+  .inst-sub { font-size: 12px; color: #9ca3af; margin-top: 2px; }
+
+  .badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; }
+  .badge::before { content: ''; width: 8px; height: 8px; border-radius: 50%; }
+  .badge.open { background: #d1fae5; color: #065f46; }
+  .badge.open::before { background: #10b981; }
+  .badge.close { background: #f3f4f6; color: #6b7280; }
+  .badge.close::before { background: #9ca3af; }
+  .badge.connecting { background: #fef3c7; color: #92400e; }
+  .badge.connecting::before { background: #f59e0b; }
+  .badge.unknown { background: #f3f4f6; color: #6b7280; }
+  .badge.unknown::before { background: #d1d5db; }
+
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; border: none; border-radius: 6px; font-size: 13px; font-weight: 500; cursor: pointer; transition: background .15s; }
+  .btn:hover { filter: brightness(.95); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn-primary { background: #25D366; color: #fff; }
+  .btn-outline { background: #fff; color: #374151; border: 1px solid #d1d5db; }
+  .btn-sm { padding: 5px 10px; font-size: 12px; }
+
+  .code { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; background: #f9fafb; padding: 2px 6px; border-radius: 4px; }
+
+  /* Modal */
+  .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 100; align-items: center; justify-content: center; }
+  .overlay.show { display: flex; }
+  .modal { background: #fff; border-radius: 14px; padding: 32px; max-width: 420px; width: 90%; text-align: center; position: relative; }
+  .modal h3 { font-size: 17px; margin-bottom: 6px; }
+  .modal .subtitle { font-size: 13px; color: #6b7280; margin-bottom: 20px; }
+  .modal .qr-box { min-height: 280px; display: flex; align-items: center; justify-content: center; }
+  .modal .qr-box img { max-width: 260px; border-radius: 8px; }
+  .modal .hint { font-size: 12px; color: #9ca3af; margin-top: 16px; }
+  .modal .close-btn { position: absolute; top: 12px; right: 16px; background: none; border: none; font-size: 20px; cursor: pointer; color: #9ca3af; }
+
+  /* Toast */
+  #toast { position: fixed; bottom: 20px; right: 20px; padding: 12px 20px; background: #1f2937; color: #fff; border-radius: 8px; font-size: 13px; display: none; z-index: 200; max-width: 360px; }
+  #toast.error { background: #dc2626; }
+  #toast.success { background: #059669; }
+
+  /* Setup result */
+  .setup-result { margin-top: 12px; font-size: 13px; max-height: 200px; overflow: auto; }
+  .setup-result .ok { color: #059669; }
+  .setup-result .fail { color: #dc2626; }
+
+  .empty { text-align: center; padding: 40px 20px; color: #9ca3af; }
+  .empty p { margin-top: 8px; font-size: 14px; }
+
+  @media (max-width: 640px) {
+    th:nth-child(3), td:nth-child(3) { display: none; }
+    .header { flex-direction: column; align-items: flex-start; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>WhatsApp Evolution</h1>
+  <div class="header-actions">
+    <button class="btn btn-outline" onclick="runSetup()" id="btn-setup">Executar Setup</button>
+    <button class="btn btn-primary" onclick="loadInstances()">Atualizar</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Instancias</h2>
+  <div id="instances-container">
+    <div class="empty"><p>Carregando...</p></div>
+  </div>
+</div>
+
+<div id="setup-card" class="card" style="display:none">
+  <h2>Resultado do Setup</h2>
+  <div id="setup-result" class="setup-result"></div>
+</div>
+
+<!-- QR Modal -->
+<div class="overlay" id="qr-overlay">
+  <div class="modal">
+    <button class="close-btn" onclick="closeQR()">&times;</button>
+    <h3 id="qr-title">Conectar WhatsApp</h3>
+    <p class="subtitle">Escaneie o QR Code com o WhatsApp</p>
+    <div class="qr-box" id="qr-box">
+      <p style="color:#9ca3af">Carregando...</p>
+    </div>
+    <p class="hint">WhatsApp &rarr; Aparelhos conectados &rarr; Conectar um aparelho</p>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<!-- BX24 JS SDK (funciona dentro do iframe do Bitrix24; falha silenciosamente fora) -->
+<script>
+(function(){
+  var s = document.createElement('script');
+  s.src = '//api.bitrix24.com/api/v1/';
+  s.onload = function(){
+    if(typeof BX24!=='undefined') BX24.init(function(){ BX24.fitWindow(); });
+  };
+  s.onerror = function(){}; // Ignora fora do Bitrix24
+  document.head.appendChild(s);
+})();
+</script>
+
+<script>
+const BASE = window.location.origin;
+let _qrTimer = null;
+
+// ─── Instances ──────────────────────────────────────────────────────────────
+
+async function loadInstances() {
+  try {
+    const r = await fetch(BASE + '/api/instances');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    renderInstances(data);
+  } catch(e) {
+    toast('Erro ao carregar: ' + e.message, 'error');
+  }
+}
+
+function renderInstances(list) {
+  const el = document.getElementById('instances-container');
+  if (!list.length) {
+    el.innerHTML = '<div class="empty"><p>Nenhuma instancia configurada.<br>Edite <span class="code">instances.json</span> e reinicie o app.</p></div>';
+    return;
+  }
+  el.innerHTML = `
+    <table>
+      <thead><tr><th>Instancia</th><th>Evolution</th><th>Linha</th><th>Status</th><th>Acoes</th></tr></thead>
+      <tbody>${list.map(renderRow).join('')}</tbody>
+    </table>`;
+}
+
+function renderRow(i) {
+  const statusClass = i.status || 'unknown';
+  const statusText = {open:'Conectado', close:'Desconectado', connecting:'Conectando...'}[i.status] || i.status || 'Desconhecido';
+  const btnLabel = i.status === 'open' ? 'Reconectar' : 'Conectar';
+  const btnClass = i.status === 'open' ? 'btn-outline btn-sm' : 'btn-primary btn-sm';
+  return `<tr>
+    <td><div class="inst-name">${esc(i.label)}</div><div class="inst-sub">${esc(i.name)}</div></td>
+    <td><span class="code">${esc(i.evolution_instance)}</span></td>
+    <td>${esc(i.line_id)}</td>
+    <td><span class="badge ${statusClass}">${statusText}</span></td>
+    <td><button class="btn ${btnClass}" onclick="showQR('${esc(i.name)}','${esc(i.label)}')">${btnLabel}</button></td>
+  </tr>`;
+}
+
+// ─── QR Code ────────────────────────────────────────────────────────────────
+
+async function showQR(name, label) {
+  document.getElementById('qr-title').textContent = 'Conectar: ' + label;
+  document.getElementById('qr-box').innerHTML = '<p style="color:#9ca3af">Carregando QR Code...</p>';
+  document.getElementById('qr-overlay').classList.add('show');
+  await fetchQR(name);
+  // Auto-refresh QR a cada 20s (QR expira ~60s)
+  clearInterval(_qrTimer);
+  _qrTimer = setInterval(() => fetchQR(name), 20000);
+}
+
+async function fetchQR(name) {
+  try {
+    const r = await fetch(BASE + '/api/instances/' + encodeURIComponent(name) + '/qr');
+    const data = await r.json();
+    const box = document.getElementById('qr-box');
+
+    if (data.connected) {
+      box.innerHTML = '<p style="color:#10b981;font-size:18px;font-weight:600">Ja conectado!</p>';
+      clearInterval(_qrTimer);
+      setTimeout(() => { closeQR(); loadInstances(); }, 2000);
+    } else if (data.base64) {
+      const src = data.base64.startsWith('data:') ? data.base64 : 'data:image/png;base64,' + data.base64;
+      box.innerHTML = '<img src="' + src + '" alt="QR Code">';
+    } else {
+      box.innerHTML = '<p style="color:#dc2626">' + esc(data.error || 'QR Code nao disponivel') + '</p>';
+    }
+  } catch(e) {
+    document.getElementById('qr-box').innerHTML = '<p style="color:#dc2626">Erro: ' + esc(e.message) + '</p>';
+  }
+}
+
+function closeQR() {
+  document.getElementById('qr-overlay').classList.remove('show');
+  clearInterval(_qrTimer);
+  loadInstances();
+}
+
+// ─── Setup ──────────────────────────────────────────────────────────────────
+
+async function runSetup() {
+  const btn = document.getElementById('btn-setup');
+  btn.disabled = true;
+  btn.textContent = 'Executando...';
+  toast('Executando setup...');
+
+  try {
+    const r = await fetch(BASE + '/setup', {method:'POST'});
+    const data = await r.json();
+    showSetupResult(data);
+    loadInstances();
+    toast('Setup concluido!', 'success');
+  } catch(e) {
+    toast('Erro no setup: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Executar Setup';
+  }
+}
+
+function showSetupResult(data) {
+  const card = document.getElementById('setup-card');
+  const el = document.getElementById('setup-result');
+  card.style.display = 'block';
+
+  const lines = Object.entries(data).map(([k, v]) => {
+    const hasError = v && v.error;
+    const cls = hasError ? 'fail' : 'ok';
+    const icon = hasError ? '&#10007;' : '&#10003;';
+    const detail = hasError ? v.error : 'OK';
+    return '<div class="' + cls + '">' + icon + ' <strong>' + esc(k) + '</strong>: ' + esc(String(detail)) + '</div>';
+  });
+  el.innerHTML = lines.join('');
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function toast(msg, type) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = type || '';
+  t.style.display = 'block';
+  clearTimeout(t._tid);
+  t._tid = setTimeout(() => t.style.display = 'none', 4000);
+}
+
+// ─── Init ───────────────────────────────────────────────────────────────────
+
+loadInstances();
+setInterval(loadInstances, 30000);
+</script>
+</body>
+</html>

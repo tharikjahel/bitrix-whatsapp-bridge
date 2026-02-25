@@ -1,0 +1,26 @@
+# Dados sensíveis — nunca commitar
+.env
+*.db
+*.db-shm
+*.db-wal
+
+# Mídia baixada em runtime
+media/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.env.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

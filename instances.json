@@ -1,0 +1,14 @@
+[
+  {
+    "name": "vendas",
+    "evolution_instance": "vendas",
+    "bitrix24_line_id": "1",
+    "label": "WhatsApp Vendas"
+  },
+  {
+    "name": "suporte",
+    "evolution_instance": "suporte",
+    "bitrix24_line_id": "2",
+    "label": "WhatsApp Suporte"
+  }
+]
