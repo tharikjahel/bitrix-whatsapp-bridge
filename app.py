@@ -98,7 +98,7 @@ async def evolution_webhook(
 
     payload: dict = await request.json()
 
-    if payload.get("event") != "MESSAGES_UPSERT":
+    if payload.get("event","").lower().replace(".","_") != "messages_upsert":
         return {"ok": True}
 
     data = payload.get("data", {})
@@ -111,7 +111,23 @@ async def evolution_webhook(
     if "@g.us" in remote_jid:
         return {"ok": True}
 
-    wa_phone   = remote_jid.split("@")[0]
+    # Contatos @lid (novo identificador Meta): usar remoteJidAlt para obter o número real
+    if remote_jid.endswith("@lid"):
+        remote_jid_alt: str = key.get("remoteJidAlt", "")
+        if remote_jid_alt:
+            wa_phone = remote_jid_alt.split("@")[0]
+            logger.info(
+                "[%s] @lid resolvido via remoteJidAlt: %s → %s",
+                instance_name, remote_jid, wa_phone,
+            )
+        else:
+            logger.warning(
+                "[%s] @lid sem remoteJidAlt, mensagem ignorada: %s",
+                instance_name, remote_jid,
+            )
+            return {"ok": True}
+    else:
+        wa_phone = remote_jid.split("@")[0]
     push_name  = data.get("pushName") or wa_phone
     message_id = key.get("id", "")
     message    = data.get("message", {})
@@ -258,21 +274,23 @@ def _capture_chat_id(
         )
         return
 
-    data_block = result_data.get("DATA", {})
-    if not isinstance(data_block, dict):
-        logger.warning(
-            "[%s] Unexpected DATA block type: %s | full: %s",
-            instance_name, type(data_block), result_data,
-        )
-        return
-
-    chat_id_raw = data_block.get("CHAT_ID")
     chat_id = ""
 
-    if isinstance(chat_id_raw, dict):
-        chat_id = str(chat_id_raw.get(wa_phone, ""))
-    elif chat_id_raw is not None:
-        chat_id = str(chat_id_raw)
+    # Format 1 (legacy): result.DATA.CHAT_ID
+    data_block = result_data.get("DATA", {})
+    if isinstance(data_block, dict):
+        chat_id_raw = data_block.get("CHAT_ID")
+        if isinstance(chat_id_raw, dict):
+            chat_id = str(chat_id_raw.get(wa_phone, ""))
+        elif chat_id_raw is not None:
+            chat_id = str(chat_id_raw)
+
+    # Format 2 (current): result.DATA.RESULT[0].session.CHAT_ID
+    if not chat_id:
+        result_list = data_block.get("RESULT", [])
+        if isinstance(result_list, list) and result_list:
+            session = result_list[0].get("session", {})
+            chat_id = str(session.get("CHAT_ID", ""))
 
     if chat_id:
         storage.save_session(chat_id, wa_phone, instance_name, push_name)
@@ -293,8 +311,15 @@ def _capture_chat_id(
 
 @app.post("/webhook/bitrix")
 async def bitrix_webhook(request: Request, bg: BackgroundTasks):
-    body    = await request.body()
-    payload = _parse_bitrix_payload(body)
+    body = await request.body()
+    # Replicate PHP $_REQUEST: merge query string (GET) + body (POST).
+    # Bitrix24 sometimes sends `event` and `auth[...]` as query params while
+    # `data[...]` goes in the POST body — a pure body-read misses those fields.
+    # Concatenate QS first so body values take precedence on duplicate keys.
+    qs       = request.url.query
+    body_str = body.decode("utf-8", errors="replace")
+    raw      = "&".join(p for p in [qs, body_str] if p.strip())
+    payload  = _parse_bitrix_payload(raw.encode())
 
     logger.info(
         "Bitrix24 event received: %s | top-keys: %s",
@@ -337,7 +362,7 @@ def _parse_bitrix_payload(body: bytes) -> dict:
     flat = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
     result: dict = {}
     for compound_key, values in sorted(flat.items()):
-        value = values[0] if len(values) == 1 else values
+        value = values[-1]  # last value wins: body (POST) overrides query string (GET)
         keys = re.findall(r"[^\[\]]+", compound_key)
         if keys:
             _nested_set(result, keys, value)
@@ -437,7 +462,11 @@ async def _forward_to_whatsapp(data: dict):
                 try:
                     await bitrix.delivery_status(
                         line_id,
-                        [{"id": bitrix_msg_id, "chat": {"id": wa_chat_id or wa_phone}}],
+                        [{
+                            "im":      im,
+                            "message": {"id": [bitrix_msg_id]},
+                            "chat":    {"id": wa_chat_id or wa_phone},
+                        }],
                     )
                 except Exception as exc:
                     logger.warning("delivery_status failed (non-critical): %s", exc)
@@ -527,16 +556,51 @@ def _cleanup_old_media(max_age_seconds: int = 86400):
 # 4.  Bitrix24 Local App install handler
 # ════════════════════════════════════════════════════════════════════════════
 
-@app.post("/bitrix/install")
-@app.get("/bitrix/install")
-async def bitrix_install(request: Request):
-    if request.method == "POST":
-        raw     = await request.form()
-        payload = dict(raw)
-    else:
-        payload = dict(request.query_params)
+_INSTALL_OK_HTML = (
+    "<html><body style='font-family:sans-serif;padding:40px;text-align:center'>"
+    "<h2 style='color:#10b981'>WhatsApp Bridge instalado!</h2>"
+    "<p>Abra a <b>UI do conector</b> na Linha Aberta para configurar.</p>"
+    "<p style='margin-top:20px;color:#9ca3af;font-size:13px'>"
+    "Ou acesse <code>/bitrix/connector-ui</code> para vincular instancias.</p>"
+    "<script>if(typeof BX24!=='undefined')BX24.init(function(){});</script>"
+    "</body></html>"
+)
 
-    logger.info("Bitrix24 install handler. Keys: %s", list(payload.keys()))
+
+@app.get("/bitrix/install")
+async def bitrix_install_get():
+    return HTMLResponse(_INSTALL_OK_HTML)
+
+
+@app.post("/bitrix/install")
+async def bitrix_install_post(request: Request):
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+    else:
+        try:
+            raw     = await request.form()
+            payload = dict(raw)
+            # REBUILD_AUTH_FROM_BRACKET_KEYS
+            # Bitrix24 manda auth como form fields: auth[access_token], auth[client_endpoint], etc.
+            # Precisamos reconstruir o dict ⁠ auth ⁠ e também normalizar DOMAIN/ENDPOINTs.
+            auth_from_form = {}
+            for k, v in payload.items():
+                m = re.match(r"^auth\[(.+?)\]$", str(k))
+                if m:
+                    auth_from_form[m.group(1)] = v
+
+            # Se vier em formato achatado, cria também payload["auth"] pra lógica abaixo funcionar
+            if auth_from_form and not isinstance(payload.get("auth"), dict):
+                payload["auth"] = auth_from_form
+
+        except Exception:
+            payload = {}
+
+    logger.info("Bitrix24 install POST. Keys: %s", list(payload.keys()))
 
     auth = payload.get("auth", {})
     if isinstance(auth, str):
@@ -544,54 +608,74 @@ async def bitrix_install(request: Request):
             auth = json.loads(auth)
         except Exception:
             auth = {}
+    if not isinstance(auth, dict):
+        auth = {}
 
-    access_token  = auth.get("access_token") or payload.get("AUTH_ID", "")
-    refresh_token = auth.get("refresh_token") or payload.get("REFRESH_ID", "")
-    expires_in    = int(auth.get("expires_in") or payload.get("AUTH_EXPIRES") or 3600)
-    # SERVER_ENDPOINT is the REST API base URL (e.g. https://oauth.bitrix.info/rest/)
-    server_endpoint = payload.get("SERVER_ENDPOINT") or ""
-    # DOMAIN is the portal hostname (e.g. motoclube.bitrix24.com.br)
-    portal_domain = payload.get("DOMAIN") or auth.get("domain") or ""
-    member_id     = payload.get("member_id") or payload.get("MEMBER_ID", "")
-    domain        = server_endpoint  # keep legacy column pointing to REST endpoint
+    # Bitrix24 às vezes manda o auth como objeto (JSON) e às vezes achatado em form fields auth[...]
+    access_token  = (
+        auth.get("access_token")
+        or payload.get("auth[access_token]", "")
+        or payload.get("AUTH_ID", "")
+    )
+    refresh_token = (
+        auth.get("refresh_token")
+        or payload.get("auth[refresh_token]", "")
+        or payload.get("REFRESH_ID", "")
+    )
+    expires_in = int(
+        auth.get("expires_in")
+        or payload.get("auth[expires_in]", 0)
+        or payload.get("AUTH_EXPIRES", 3600)
+        or 3600
+    )
 
-    if access_token and server_endpoint:
+    member_id = (
+        auth.get("member_id")
+        or payload.get("auth[member_id]", "")
+        or payload.get("member_id", "")
+        or payload.get("MEMBER_ID", "")
+    )
+
+    # Endpoint do portal (o que suporta imconnector.*)
+    client_endpoint = (
+        auth.get("client_endpoint")
+        or payload.get("auth[client_endpoint]", "")
+        or ""
+    ).strip()
+
+    # DOMAIN pode não vir; quando vier, prefira ele; senão extraia do client_endpoint
+    portal_domain = (payload.get("DOMAIN") or "").strip()
+    if not portal_domain and client_endpoint:
+        portal_domain = (
+            client_endpoint.replace("https://", "")
+                          .replace("http://", "")
+                          .split("/")[0]
+                          .strip()
+        )
+
+    # Sempre preferir o REST do portal; se não vier, cai no portal_domain
+    server_endpoint = ""
+    if client_endpoint:
+        server_endpoint = client_endpoint if client_endpoint.endswith("/") else client_endpoint + "/"
+    elif portal_domain:
+        server_endpoint = f"https://{portal_domain}/rest/"
+
+    domain = server_endpoint
+
+    if access_token:
         storage.save_oauth(
             access_token, refresh_token, expires_in, domain,
             member_id=member_id, server_endpoint=server_endpoint,
             portal_domain=portal_domain,
         )
-        app_token = (
-            auth.get("application_token") or payload.get("APPLICATION_TOKEN", "")
-        )
+        app_token = auth.get("application_token") or payload.get("APPLICATION_TOKEN", "")
         if app_token:
-            logger.info(
-                "application_token: %s — set BITRIX24_APPLICATION_TOKEN in .env",
-                app_token,
-            )
-        logger.info(
-            "Install OK: member_id=%s, portal=%s, endpoint=%s, expires_in=%s",
-            member_id, portal_domain, server_endpoint, expires_in,
-        )
-        return HTMLResponse(
-            "<html><body style='font-family:sans-serif;padding:40px;text-align:center'>"
-            "<h2 style='color:#10b981'>WhatsApp Bridge instalado!</h2>"
-            "<p>Abra a <b>UI do conector</b> na Linha Aberta para configurar.</p>"
-            "<p style='margin-top:20px;color:#9ca3af;font-size:13px'>"
-            "Ou acesse <code>/bitrix/connector-ui</code> para vincular instancias.</p>"
-            "<script>if(typeof BX24!=='undefined')BX24.init(function(){});</script>"
-            "</body></html>"
-        )
+            logger.info("application_token: %s — set BITRIX24_APPLICATION_TOKEN in .env", app_token)
+        logger.info("Install OK: member_id=%s portal=%s endpoint=%s", member_id, portal_domain, server_endpoint)
+    else:
+        logger.warning("Install POST: sem AUTH_ID. Keys: %s — retornando 200", list(payload.keys()))
 
-    logger.warning("Install handler: tokens not found. Keys: %s", list(payload.keys()))
-    return HTMLResponse(
-        "<html><body style='font-family:sans-serif;padding:40px'>"
-        "<h2 style='color:#dc2626'>Tokens nao encontrados</h2>"
-        "<p>Verifique os logs do servidor.</p>"
-        "</body></html>",
-        status_code=400,
-    )
-
+    return HTMLResponse(_INSTALL_OK_HTML)
 
 # ════════════════════════════════════════════════════════════════════════════
 # 5.  Front-end (connector UI inside Bitrix24 iframe)
@@ -908,6 +992,24 @@ async def admin_detect_portal():
     return {"ok": True, "portal_domain": domain}
 
 
+@app.post("/admin/rebind-events")
+async def admin_rebind_events():
+    """
+    Force-unbind e rebind de OnImConnectorMessageAdd com auth_type=3.
+    Use quando o Bitrix24 nao estiver chamando /webhook/bitrix.
+    """
+    oauth = storage.get_oauth()
+    if not oauth:
+        raise HTTPException(400, "Bitrix24 nao autenticado.")
+    if not oauth.get("portal_domain"):
+        raise HTTPException(400, "portal_domain nao configurado. Chame GET /admin/detect-portal primeiro.")
+    try:
+        result = await bitrix.bind_events()
+    except Exception as exc:
+        raise HTTPException(502, f"bind_events falhou: {exc}")
+    return {"ok": True, "handler": f"{settings.app_url}/webhook/bitrix", "details": result}
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 8.  Health & Debug
 # ════════════════════════════════════════════════════════════════════════════
@@ -968,10 +1070,15 @@ async def health():
 @app.post("/debug/bitrix")
 async def debug_bitrix(request: Request):
     """Log the raw Bitrix24 event for debugging."""
-    body    = await request.body()
-    payload = _parse_bitrix_payload(body)
+    body     = await request.body()
+    qs       = request.url.query
+    body_str = body.decode("utf-8", errors="replace")
+    raw      = "&".join(p for p in [qs, body_str] if p.strip())
+    payload  = _parse_bitrix_payload(raw.encode())
     logger.info(
-        "DEBUG BITRIX:\n%s",
+        "DEBUG BITRIX (qs=%r, body=%r):\n%s",
+        qs or "(empty)",
+        body_str or "(empty)",
         json.dumps(payload, indent=2, ensure_ascii=False, default=str),
     )
     return {"received": True, "event": payload.get("event")}

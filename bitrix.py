@@ -4,6 +4,7 @@ Handles automatic token refresh and imconnector methods.
 Multi-instance: line_id is passed per call (one line per WhatsApp number).
 """
 import logging
+import re
 import time
 
 import httpx
@@ -201,7 +202,7 @@ async def send_message(
                 {
                     "user": {
                         "id":                  wa_phone,
-                        "name":                (push_name or wa_phone)[:25],
+                        "name":                re.sub(r'[^A-Za-z\u00C0-\u024F\s\'-]', '', (push_name or '').strip())[:25] or 'WhatsApp',
                         "phone":               wa_phone,
                         "skip_phone_validate": "Y",
                     },
@@ -220,7 +221,7 @@ async def register_connector() -> dict:
         {
             "ID":                settings.bitrix24_connector_id,
             "NAME":              "WhatsApp (Evolution API)",
-            "ICON":              {"DATA_IMAGE": "", "COLOR": "#25D366", "CONNECTOR": "Y"},
+            "ICON":              {"DATA_IMAGE": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAeklEQVR4nO3PUQkAIBTAwFfGaha2kCH8OITBAtxmnf11wwUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWPHYBDdnhPAgqzLQAAAAASUVORK5CYII=", "COLOR": "#25D366", "CONNECTOR": "Y"},
             "PLACEMENT_HANDLER": f"{settings.app_url}/bitrix/connector-ui",
         },
     )
@@ -263,35 +264,53 @@ async def create_open_line(name: str) -> str:
 
 async def bind_events() -> dict:
     """
-    Idempotently bind OnImConnectorMessageAdd event.
-    Checks for existing bindings to avoid duplicates.
+    Bind OnImConnectorMessageAdd with auth_type=3 (system/admin context).
+
+    auth_type=3 is required for the event to fire for ALL operator replies,
+    regardless of which user sends the message in the Open Channel.
+    Without it, Bitrix24 binds the event to a specific user context and
+    connector events are never dispatched.
+
+    Always unbinds existing bindings first — the URL-only check in the old
+    code would silently skip rebinding even when auth_type was wrong.
     """
     handler_url = f"{settings.app_url}/webhook/bitrix"
 
+    # Unbind ALL existing OnImConnectorMessageAdd bindings (regardless of URL
+    # or auth_type) so we start with a clean, correctly configured binding.
     try:
         existing = await call("event.get")
         for entry in existing.get("result", []):
-            evt = entry.get("event", "").upper()
-            handler = entry.get("handler", "")
-            if evt == "ONIMCONNECTORMESSAGEADD":
-                if handler == handler_url:
-                    logger.info("event.bind already exists for %s", handler_url)
-                    return {"already_bound": True}
-                logger.info("Removing stale event handler: %s", handler)
-                await call("event.unbind", {
-                    "event":   "OnImConnectorMessageAdd",
-                    "handler": handler,
-                })
+            if entry.get("event", "").upper() == "ONIMCONNECTORMESSAGEADD":
+                old_handler   = entry.get("handler", "")
+                old_auth_type = entry.get("auth_type", "not set")
+                logger.info(
+                    "Removing existing event binding: handler=%s auth_type=%s",
+                    old_handler, old_auth_type,
+                )
+                try:
+                    await call("event.unbind", {
+                        "event":   "OnImConnectorMessageAdd",
+                        "handler": old_handler,
+                    })
+                except Exception as exc:
+                    logger.warning("event.unbind failed (continuing): %s", exc)
     except Exception as exc:
         logger.warning("event.get failed (non-critical): %s", exc)
 
-    return await call(
+    result = await call(
         "event.bind",
         {
-            "event":   "OnImConnectorMessageAdd",
-            "handler": handler_url,
+            "event":     "OnImConnectorMessageAdd",
+            "handler":   handler_url,
+            "auth_type": 3,
         },
     )
+    logger.info(
+        "event.bind OK: handler=%s auth_type=3 | result=%s",
+        handler_url, result,
+    )
+    return result
 
 
 async def delivery_status(
